@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import type { ToolCall } from '@finagent/core';
 import {
   buildFinancialEvidence,
+  computeEnvelopeId,
   financialEvidenceToJson,
   isFinancialEvidenceEnvelope,
 } from './financial-evidence.ts';
@@ -51,6 +52,15 @@ describe('buildFinancialEvidence', () => {
     expect(first.lineage.at(-1)?.version).toBe('folio-normalization/v1');
   });
 
+  it('keeps 6-digit A-share symbol arguments as the instrument id', () => {
+    const records = buildFinancialEvidence({
+      sessionId: 'session-1',
+      runId: 'run-1',
+      toolCalls: [call({ args: { symbol: '600519.SH' } })],
+    });
+    expect(records[0].instrumentId).toBe('600519.SH');
+  });
+
   it('supports fundamental and historical results', () => {
     const records = buildFinancialEvidence({
       sessionId: 's',
@@ -79,5 +89,12 @@ describe('buildFinancialEvidence', () => {
     const exported = financialEvidenceToJson(evidence);
     expect(JSON.parse(exported).schemaVersion).toBe('financial-evidence/v1');
     expect(exported).not.toContain('canary-secret');
+  });
+
+  it('matches computeEnvelopeId so citations can be issued before settle (#30)', () => {
+    const [record] = buildFinancialEvidence({ sessionId: 's', runId: 'r', toolCalls: [call()] });
+    expect(record.id).toBe(computeEnvelopeId('r', record.toolCallId, record.resultHash));
+    expect(record.id.startsWith('fe_')).toBe(true);
+    expect(computeEnvelopeId('r', 'call-1', record.resultHash)).toBe(computeEnvelopeId('r', 'call-1', record.resultHash));
   });
 });

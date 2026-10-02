@@ -10,6 +10,7 @@ import type {
 import {
   FINANCIAL_EVIDENCE_SCHEMA_VERSION,
   FINANCIAL_NORMALIZATION_VERSION,
+  readInstrumentId,
 } from '@finagent/core';
 
 const SECRET_KEY = /(authorization|api[-_]?key|access[-_]?token|refresh[-_]?token|password|cookie|secret|credential)/i;
@@ -51,7 +52,7 @@ export function buildFinancialEvidence(input: BuildFinancialEvidenceInput): Fina
     const provider = stringValue(provenance.providerId) ?? stringValue(provenance.provider) ?? 'unknown';
     const retrievedAt = numberValue(provenance.fetchedAt) ?? toolCall.completedAt ?? toolCall.startedAt;
     const asOf = numberValue(provenance.marketTime) ?? inferAsOf(result.data);
-    const instrumentId = canonicalInstrument(toolCall.args.symbol ?? inferSymbol(result.data));
+    const instrumentId = readInstrumentId(provenance) ?? canonicalInstrument(toolCall.args.symbol ?? inferSymbol(result.data));
     const values = collectValues(result.data, result.evidence);
     const snapshot = redact(result.data);
     const resultHash = hashJson(snapshot);
@@ -67,7 +68,7 @@ export function buildFinancialEvidence(input: BuildFinancialEvidenceInput): Fina
     return [{
       schemaVersion: FINANCIAL_EVIDENCE_SCHEMA_VERSION,
       normalizationVersion: FINANCIAL_NORMALIZATION_VERSION,
-      id: `fe_${hashText(`${input.runId}:${toolCall.id}:${resultHash}`).slice(0, 24)}`,
+      id: computeEnvelopeId(input.runId, toolCall.id, resultHash),
       sessionId: input.sessionId,
       runId: input.runId,
       toolCallId: toolCall.id,
@@ -82,6 +83,7 @@ export function buildFinancialEvidence(input: BuildFinancialEvidenceInput): Fina
       retrievedAt,
       ...(asOf !== undefined ? { asOf } : {}),
       stale: provenance.stale === true,
+      ...(provenance.delayed === true ? { delayed: true } : {}),
       cacheHit: result.evidence?.cacheHit === true,
       ...(result.evidence?.fallback ? { fallback: result.evidence.fallback } : {}),
       ...(result.evidence?.reconciliation ? { reconciliation: result.evidence.reconciliation } : {}),
@@ -90,6 +92,14 @@ export function buildFinancialEvidence(input: BuildFinancialEvidenceInput): Fina
       lineage,
     }];
   });
+}
+
+/**
+ * Deterministic evidence-envelope id, computable before the run settles so
+ * tool results can carry their `fe_*` id for inline citations (#30).
+ */
+export function computeEnvelopeId(runId: string, toolCallId: string, resultHash: string): string {
+  return `fe_${hashText(`${runId}:${toolCallId}:${resultHash}`).slice(0, 24)}`;
 }
 
 /** Runtime guard used by claim verifiers and import/export boundaries. */
@@ -165,7 +175,7 @@ function redact(value: unknown): unknown {
 function canonicalInstrument(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const normalized = value.trim().toUpperCase();
-  return /^[A-Z0-9]{1,5}\.(US|HK|SG|SH|SZ|HAS)$/.test(normalized) ? normalized : undefined;
+  return /^[A-Z0-9]{1,6}\.(US|HK|SG|SH|SZ|HAS)$/.test(normalized) ? normalized : undefined;
 }
 
 function inferSymbol(data: unknown): unknown {

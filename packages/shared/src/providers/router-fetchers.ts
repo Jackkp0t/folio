@@ -13,6 +13,7 @@ import {
   type PortfolioSnapshot,
   type ProviderError,
   type ProviderResult,
+  type ProviderProvenance,
   type Quote,
   type StaticInfo,
 } from '@finagent/core';
@@ -33,6 +34,7 @@ import type {
   GetKlineOptions,
 } from '@finagent/longbridge-tools';
 import { attachResolvedInstrument, type InstrumentQueryResolver } from './instrument.ts';
+import type { CapabilityFetchResult } from '../capabilities/fetchers.ts';
 
 /**
  * Normalized failure thrown by the router-backed fetchers. Carries the stable
@@ -57,11 +59,13 @@ export class ProviderFetchError extends Error {
 /**
  * Fetcher surface produced by `createRouterFetchers`. Structurally the
  * post-migration `CapabilityFetchers` contract (portfolio methods carry the
- * neutral `@finagent/core` account shapes); the router erases routing from
- * every consumer.
+ * neutral `@finagent/core` account shapes). Raw methods erase routing for
+ * data-only consumers; `getQuoteResult` is the explicit provenance-aware
+ * companion used by the traceable quote capability.
  */
 export interface RouterCapabilityFetchers {
   getQuote: (symbol: string) => Promise<Quote>;
+  getQuoteResult: (symbol: string, signal?: AbortSignal) => Promise<CapabilityFetchResult<Quote>>;
   getKline: (options: GetKlineOptions) => Promise<Kline[]>;
   getIntraday: (symbol: string) => Promise<IntradayData[]>;
   getMarketStatus: () => Promise<MarketStatus[]>;
@@ -78,6 +82,11 @@ export interface RouterCapabilityFetchers {
     kind?: 'IS' | 'BS' | 'CF' | 'ALL',
     report?: string
   ) => Promise<FinancialReport>;
+  getFinancialReportCandidates: (
+    symbol: string,
+    kind?: 'IS' | 'BS' | 'CF' | 'ALL',
+    report?: string
+  ) => Promise<ProviderResult<FinancialReport>[]>;
   getInstitutionRating: (symbol: string) => Promise<InstitutionRating>;
   getDividends: (symbol: string) => Promise<DividendRecord[]>;
   getEpsForecasts: (symbol: string) => Promise<EpsForecast[]>;
@@ -87,16 +96,34 @@ export interface RouterCapabilityFetchers {
   getCashFlow: (options?: GetCashFlowOptions) => Promise<CashFlowRecord[]>;
 }
 
+async function fetchResult<T>(
+  router: FinancialProviderRouter,
+  capabilityId: string,
+  input: unknown,
+  signal?: AbortSignal
+): Promise<CapabilityFetchResult<T>> {
+  const result: ProviderResult<T> = await router.execute<T>(capabilityId, input, signal);
+  if (result.ok) {
+    return { data: result.data, provenance: cloneProvenance(result.provenance) };
+  }
+  throw new ProviderFetchError(result.error);
+}
+
 async function fetch<T>(
   router: FinancialProviderRouter,
   capabilityId: string,
   input: unknown
 ): Promise<T> {
-  const result: ProviderResult<T> = await router.execute<T>(capabilityId, input);
-  if (result.ok) {
-    return result.data;
-  }
-  throw new ProviderFetchError(result.error);
+  return (await fetchResult<T>(router, capabilityId, input)).data;
+}
+
+function cloneProvenance(provenance: ProviderProvenance): ProviderProvenance {
+  return {
+    ...provenance,
+    ...(provenance.failoverTrail
+      ? { failoverTrail: provenance.failoverTrail.map((step) => ({ ...step })) }
+      : {}),
+  };
 }
 
 export interface RouterFetcherOptions {
@@ -139,6 +166,8 @@ export function createRouterFetchers(
   const resolve = options.resolve;
   return {
     getQuote: (symbol) => fetch(router, 'market.quote', bindSymbolInput(symbol, {}, resolve)),
+    getQuoteResult: (symbol, signal) =>
+      fetchResult(router, 'market.quote', bindSymbolInput(symbol, {}, resolve), signal),
     getKline: (options) =>
       fetch(router, 'market.kline', bindSymbolInput(options.symbol, { ...options }, resolve)),
     getIntraday: (symbol) => fetch(router, 'market.intraday', bindSymbolInput(symbol, {}, resolve)),
@@ -157,6 +186,8 @@ export function createRouterFetchers(
     getMarketTemperature: (market) => fetch(router, 'market.sentiment', { market }),
     getFinancialReport: (symbol, kind, report) =>
       fetch(router, 'company.financials', bindSymbolInput(symbol, { kind, report }, resolve)),
+    getFinancialReportCandidates: (symbol, kind, report) =>
+      router.executeAll<FinancialReport>('company.financials', bindSymbolInput(symbol, { kind, report }, resolve)),
     getInstitutionRating: (symbol) =>
       fetch(router, 'company.ratings', bindSymbolInput(symbol, {}, resolve)),
     getDividends: (symbol) =>

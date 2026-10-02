@@ -306,6 +306,38 @@ export class ProviderRouter implements FinancialProviderRouter {
     return { ok: false, error: unsupported(capabilityId) };
   }
 
+  async executeAll<T>(
+    capabilityId: CapabilityId,
+    input: unknown,
+    signal?: AbortSignal
+  ): Promise<ProviderResult<T>[]> {
+    if (signal?.aborted) return [{ ok: false, error: ABORTED }];
+    const capabilityOverride = this.capabilityRouting.get(capabilityId);
+    const routing = capabilityOverride
+      ? capabilityOverride
+      : this.resolveRouting
+        ? await this.resolveRouting()
+        : this.routing;
+    const order = [routing.primary, routing.fallback].filter(
+      (id): id is string => typeof id === 'string' && id.length > 0
+    );
+    for (const provider of this.registry.list()) {
+      if (!order.includes(provider.id) && supports(provider, capabilityId)) order.push(provider.id);
+    }
+    const results: ProviderResult<T>[] = [];
+    for (const id of order) {
+      const provider = this.get(id);
+      if (!provider || !supports(provider, capabilityId)) continue;
+      if (this.isEnabled && !(await this.isEnabled(id))) continue;
+      const outcome = await runWithRetry<T>(
+        () => this.invokeWithTimeout<T>(provider, capabilityId, input, signal),
+        this.retryOptions
+      );
+      results.push(outcome.result);
+    }
+    return results;
+  }
+
   // ── internals ──────────────────────────────────────────────────────────
 
   private attachTrail(provenance: ProviderProvenance, trail: ProviderFailoverStep[]): ProviderProvenance {
@@ -373,6 +405,7 @@ export class ProviderRouter implements FinancialProviderRouter {
     }
 
     const controller = new AbortController();
+    const externalAbort = Promise.withResolvers<ProviderResult<T>>();
     let settled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
 
@@ -382,13 +415,13 @@ export class ProviderRouter implements FinancialProviderRouter {
       externalSignal?.removeEventListener('abort', onExternalAbort);
     };
     const onExternalAbort = (): void => {
+      if (settled) return;
+      settled = true;
       controller.abort();
-      if (!settled) {
-        settled = true;
-        if (timer) clearTimeout(timer);
-      }
+      if (timer) clearTimeout(timer);
+      externalAbort.resolve({ ok: false, error: ABORTED });
     };
-    externalSignal?.addEventListener('abort', onExternalAbort);
+    externalSignal?.addEventListener('abort', onExternalAbort, { once: true });
 
     const work = this.invoke<T>(provider, capabilityId, input, controller.signal).then(
       (result) => {
@@ -420,15 +453,7 @@ export class ProviderRouter implements FinancialProviderRouter {
       }, this.timeoutMs);
     });
 
-    const externalAbort = new Promise<ProviderResult<T>>((resolve) => {
-      if (!externalSignal) return;
-      externalSignal.addEventListener('abort', () => {
-        cleanup();
-        resolve({ ok: false, error: ABORTED });
-      });
-    });
-
-    return Promise.race([work, timeout, externalAbort]);
+    return Promise.race([work, timeout, externalAbort.promise]);
   }
 
   private coverageFor(provider: AnyProvider): ProviderCoverage {

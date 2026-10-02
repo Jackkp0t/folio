@@ -112,4 +112,26 @@ describe('AutomationRunRepository', () => {
     expect(await fresh.claimScheduledOccurrence('r1', 'Tue Jan 02 2024')).toBe(true)
     expect(await fresh.claimScheduledOccurrence('r2', 'Mon Jan 01 2024')).toBe(true)
   })
+
+  it('persists the no-material outcome and captured portfolio scope across restarts', async () => {
+    const noMaterialRun: AutomationRun = {
+      ...run('run-quiet', 'portfolio-rule', 1_700_000_000_000),
+      evaluated: 2,
+      materialChanges: 0,
+      analyzed: 0,
+      notified: false,
+      outcome: 'no_material_update',
+      scopeSnapshot: {
+        kind: 'portfolio',
+        symbols: ['AAPL.US', 'MSFT.US'],
+        capturedAt: 1_700_000_000_000,
+        sourceFetchedAt: 1_699_999_000_000,
+      },
+    }
+    await new AutomationRunRepository(store).record(noMaterialRun)
+
+    const fresh = new AutomationRunRepository(new JsonFileStore(dir))
+
+    expect(await fresh.listByRule('portfolio-rule')).toEqual([noMaterialRun])
+  })
 })

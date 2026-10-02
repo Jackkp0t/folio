@@ -5,6 +5,9 @@ import type { FinancialEvidenceEnvelope } from './financial-evidence.ts';
 
 export type { SupportedLocale, LocalePreference } from './locale.ts';
 
+// Stream Event Protocol v1 (issue #27, docs/adr/0001-stream-event-protocol.md)
+export * from './stream-events.ts';
+
 export interface Quote {
   symbol: string;
   /** Folio canonical instrument id when the quote was resolved through the catalog. */
@@ -257,8 +260,24 @@ export interface ToolCompletedPayload {
   toolCall: ToolCall;
 }
 
+/**
+ * Token — and, when the provider reports it, cost — usage of one model call.
+ * Providers shape this differently, so the runtime adapter normalizes it before
+ * it reaches the event stream.
+ */
+export interface TokenUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  /** Provider-reported cost in USD, when available. */
+  costUsd?: number;
+}
+
 export interface MessageCompletedPayload {
   answer: string;
+  /** Present when the runtime reports usage for this model call; absent otherwise. */
+  usage?: TokenUsage;
 }
 
 export interface RunCompletedPayload {
@@ -554,6 +573,7 @@ export interface Skill {
 
 // ── Folio V3 domains ───────────────────────────────────────────────────────
 export * from './answer-blocks.ts';
+export * from './citations.ts';
 export * from './capability.ts';
 export * from './research.ts';
 export * from './thesis.ts';
@@ -580,3 +600,5 @@ export * from './trace-projection.ts';
 export * from './instrument.ts';
 export * from './instrument-catalog.ts';
 export * from './financial-evidence.ts';
+export * from './reconciliation.ts';
+export * from './reconciliation-provider.ts';

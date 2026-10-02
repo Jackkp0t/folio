@@ -5,6 +5,7 @@ import { defineCapability } from '../define.ts';
 import { normalizeSymbol } from '../validate.ts';
 import type { CapabilityFetchers } from '../fetchers.ts';
 import { defaultCapabilityFetchers } from '../fetchers.ts';
+import { sanitizeNewsItems } from '../../research/sanitize.ts';
 
 export function createResearchNewsCapability(
   fetchers: CapabilityFetchers = defaultCapabilityFetchers
@@ -23,13 +24,20 @@ export function createResearchNewsCapability(
     }),
     async execute(input, ctx) {
       const symbol = normalizeSymbol(input.symbol);
-      const news = await fetchers.getNews(symbol);
+      // Security: news text is untrusted external content — sanitize at the
+      // single ingestion point so every downstream consumer (capability
+      // summaries, research data bundles, Copilot tool results) sees
+      // neutralized text only.
+      const news = sanitizeNewsItems(await fetchers.getNews(symbol));
+      // NewsItem.timestamp is epoch SECONDS (see formatNews below);
+      // provenance.marketTime is epoch MS everywhere else.
+      const latest = news[0];
       return {
         data: news,
         provenance: {
           provider: 'longbridge',
           fetchedAt: (ctx?.now ?? Date.now)(),
-          marketTime: news[0]?.timestamp,
+          marketTime: latest === undefined ? undefined : latest.timestamp * 1000,
           stale: false,
         },
         summary: formatNews(symbol, news),

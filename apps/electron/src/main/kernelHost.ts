@@ -74,6 +74,7 @@ import type {
 import { DEFAULT_INSTRUMENT_CATALOG, InstrumentResolver, STRATEGY_IDS } from '@finagent/core';
 import { isLocalePreference } from '@finagent/i18n';
 import { createAppPreferencesService, type AppPreferencesService } from './app-preferences.ts';
+import { buildImpactPrompt, buildRiskSummaryPrompt, buildSynthesisPrompt } from './research-prompts.ts';
 import {
   AgentKernel,
   AlertEngine,
@@ -154,6 +155,7 @@ import {
   type BriefPortfolioSummary,
   type MarketPulseSnapshot,
   type ShareCard,
+  type StreamReplayResult,
   type WatchlistQuote,
   withDemoDataFallback,
 } from '@finagent/shared';
@@ -283,6 +285,7 @@ export class AgentKernelHost {
   private instrumentResolver: InstrumentResolver;
   private activeLogin: { cancel: () => void } | null = null;
   private unsubscribe: (() => void) | null = null;
+  private streamUnsubscribe: (() => void) | null = null;
   private connectionsUnsubscribe: (() => void) | null = null;
   private window: BrowserWindow | null = null;
 
@@ -479,6 +482,14 @@ export class AgentKernelHost {
         window.webContents.send('agent:event', event);
       }
     });
+    // Stream Event Protocol v1 (issue #27): parallel transport for the
+    // protocol channel, alongside the legacy agent:event delivery.
+    this.streamUnsubscribe?.();
+    this.streamUnsubscribe = this.kernel.runs.subscribeStream((sessionId, event) => {
+      if (!window.isDestroyed()) {
+        window.webContents.send('agent:stream', { sessionId, event });
+      }
+    });
     this.connectionsUnsubscribe?.();
     this.connectionsUnsubscribe = this.connectionStore.subscribe(() => {
       void this.pushConnections();
@@ -560,6 +571,20 @@ export class AgentKernelHost {
     await this.kernel.runs.cancelRun(
       requireString(request.sessionId, 'sessionId'),
       requireString(request.runId, 'runId')
+    );
+  }
+
+  /** Stream Event replay（ADR 0001 §Reconnect）：按 lastSequence 补发或明确不可恢复。 */
+  streamReplay(input: unknown): StreamReplayResult {
+    const request = requireObject(input);
+    const lastSequence = request.lastSequence;
+    // 游标必须是非负整数：0 表示从头补发，负数/小数/NaN 都是非法客户端状态。
+    if (typeof lastSequence !== 'number' || !Number.isInteger(lastSequence) || lastSequence < 0) {
+      throw createCodeError('INVALID_ARGUMENT', 'lastSequence must be a non-negative integer.');
+    }
+    return this.kernel.runs.replayStream(
+      requireString(request.runId, 'runId'),
+      lastSequence
     );
   }
 
@@ -2354,12 +2379,15 @@ export class AgentKernelHost {
       locale: await this.effectiveRunLocale(),
       researchStart: async (symbol, strategyId) => this.researchService.start(symbol, strategyId, await this.effectiveRunLocale()),
       notify: (event) => void this.dispatchNotification(event),
-      portfolioSymbols: async () => {
+      portfolioSnapshot: async () => {
         try {
           const snapshot = await this.marketData.getPortfolio();
-          return (snapshot.holdings ?? []).map((holding) => holding.symbol);
+          return {
+            symbols: (snapshot.holdings ?? []).map((holding) => holding.symbol),
+            fetchedAt: snapshot.fetchedAt,
+          };
         } catch {
-          return [];
+          return null;
         }
       },
       thesisSymbols: async () => {
@@ -2549,6 +2577,8 @@ export class AgentKernelHost {
     this.unsubscribe = null;
     this.unsubscribeEval?.();
     this.unsubscribeEval = null;
+    this.streamUnsubscribe?.();
+    this.streamUnsubscribe = null;
     this.window = null;
     await this.kernel.dispose();
   }
@@ -2671,76 +2701,7 @@ function isNodeError(error: unknown): error is NodeJS.ErrnoException {
 }
 
 // -- V3 prompt builders ------------------------------------------------------
-
-function buildSynthesisPrompt(input: ResearchSynthesisInput): string {
-  return [
-    '[FOLIO_CHECKPOINT_SYNTHESIS_V1]',
-    'Use only the saved facts below. Tool calls are disabled for this synthesis.',
-    'You are the Folio research synthesizer. Analyze the structured market data below',
-    `for ${input.symbol} and produce a JSON research synthesis.`,
-    '',
-    'Planned capabilities: ' + input.plannedCapabilities.join(', '),
-    '',
-    'Capability outcomes:',
-    ...input.runs.map(
-      (run) =>
-        `- ${run.capabilityId}: ${run.status}${run.error ? ` (error: ${run.error})` : ''}${run.summary ? ` — ${run.summary}` : ''}`
-    ),
-    '',
-    'Structured data bundle (facts; never invent values not present here):',
-    '```json',
-    input.dataBundle,
-    '```',
-    '',
-    'Respond with ONLY a JSON object matching this shape (no prose outside it):',
-    '{"summary": string, "stance": "bullish"|"bearish"|"neutral", "confidence": 0..1,',
-    ' "sections": [{"key": string, "title": string, "verdict": "positive"|"negative"|"neutral"|"unavailable", "summary": string}],',
-    ' "bullCase": string[], "bearCase": string[], "catalysts": string[], "risks": string[]}',
-    '',
-    'Sections must cover every planned capability; a capability that failed or has no data',
-    'gets verdict "unavailable" with an explicit note. Do not fabricate numbers or events.',
-  ].join('\n');
-}
-
-function buildImpactPrompt(input: ThesisImpactInput): string {
-  return [
-    'You are the Folio thesis evaluator. Compare the existing investment thesis',
-    `for ${input.thesis.symbol} against the fresh data below and decide how the new facts`,
-    'affect the thesis.',
-    '',
-    'Existing thesis (JSON):',
-    '```json',
-    JSON.stringify(input.thesis, null, 2),
-    '```',
-    '',
-    'Fresh data bundle:',
-    '```json',
-    input.dataBundle,
-    '```',
-    '',
-    'Respond with ONLY a JSON object matching this shape:',
-    '{"kind": "unchanged"|"strengthened"|"weakened"|"invalidated",',
-    ' "summary": "one clear sentence explaining why",',
-    ' "updatedThesis": <the full InvestmentThesis JSON with updatedAt/lastReviewedAt set to now and',
-    '   any stance/cases/risks adjusted to reflect the new facts>}',
-    '',
-    'updatedThesis must keep every field of the original thesis; only adjust what the new facts',
-    'actually change. Never invent data.',
-  ].join('\n');
-}
-
-function buildRiskSummaryPrompt(input: PortfolioRiskSynthesisInput): string {
-  return [
-    'You are the Folio portfolio risk analyst. Summarize the top risk findings from the',
-    'structured portfolio data below in 2-4 sentences of plain prose (no JSON, no markdown).',
-    '',
-    'Allocation: ' + JSON.stringify(input.allocation),
-    'Concentration: ' + JSON.stringify(input.concentration),
-    'Signals: ' + JSON.stringify(input.signals),
-    '',
-    'Mention only what the data supports; if there are no signals, say the portfolio looks',
-    'balanced and note any missing data explicitly.',
-  ].join('\n');
-}
+// Pure builders live in ./research-prompts.ts (imported at the top) so the
+// security guard-rail contract is unit-testable without the electron shell.
 
 export { isApiResult };
